@@ -2,7 +2,11 @@
 
 Code release for EMVSNet (evidential multi-view stereo), with training, depth inference, uncertainty estimation, and depth-map fusion.
 
-The EMVSNet paper has been accepted for the ISPRS 2026 Toronto Congress.
+---
+
+> **News:** The EMVSNet paper has been accepted for the ISPRS 2026 Toronto Congress.
+
+---
 
 This repository includes:
 
