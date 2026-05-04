@@ -1,0 +1,59 @@
+version: '3.8'
+
+services:
+  emvsnet-training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: emvsnet:latest
+    container_name: emvsnet-training
+    runtime: nvidia
+    environment:
+      # Container paths (data mount target; DTU dataset must be at /workspace/data/mvs_training/dtu)
+      - DATA_PATH=/workspace/data
+      - OUTPUT_PATH=${OUTPUT_PATH:-./output}
+      - WORKSPACE=/workspace
+      
+      # GPU configuration
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0}
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+      
+      # Python configuration
+      - PYTHONUNBUFFERED=1
+      - PYTHONNOUSERSITE=1
+      - PYTHONPATH=/workspace
+      - PYTHONFAULTHANDLER=1
+      
+      # PyTorch configuration
+      - TORCH_SHOW_CPP_STACKTRACES=1
+      
+    volumes:
+      # Host path (set HOST_DATA_PATH or use ./data) mounted at /workspace/data; DTU at mvs_training/dtu under that
+      - ${HOST_DATA_PATH:-${DATA_PATH:-./data}}:/workspace/data:ro
+      
+      # Mount output directory for checkpoints and logs
+      - ${OUTPUT_PATH:-./output}:/workspace/output
+      
+      # Mount code directory (optional, for development)
+      # Uncomment if you want to mount code for live editing:
+      # - .:/workspace
+    
+    # Shared memory for DataLoader workers
+    shm_size: '8gb'
+    
+    # Resource limits (adjust based on your needs)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-1}
+              capabilities: [gpu]
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+    
+    # Override default command if needed
+    # command: python train.py --dataset=dtu_yao --batch_size=1 ...

@@ -1,0 +1,457 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .module import *
+from evidential.models import *
+
+class IntraViewAAModule(nn.Module):
+    def __init__(self):
+        super(IntraViewAAModule,self).__init__()
+        base_filter = 8
+        self.deformconv0 = deformconvgnrelu(base_filter * 4, base_filter * 4, kernel_size=3, stride=1, dilation=1)
+        self.conv0 = convgnrelu(base_filter * 4, base_filter * 2, kernel_size=1, stride=1, dilation=1)
+        self.deformconv1 = deformconvgnrelu(base_filter * 4, base_filter * 4, kernel_size=3, stride=1, dilation=1)
+        self.conv1 = convgnrelu(base_filter * 4, base_filter * 1, kernel_size=1, stride=1, dilation=1)
+        self.deformconv2 = deformconvgnrelu(base_filter * 4, base_filter * 4, kernel_size=3, stride=1, dilation=1)
+        self.conv2 = convgnrelu(base_filter * 4, base_filter * 1, kernel_size=1, stride=1, dilation=1)
+    
+    def forward(self, x0, x1, x2):
+        m0 = self.conv0(self.deformconv0(x0))
+        x1_ = self.conv1(self.deformconv1(x1))
+        x2_ = self.conv2(self.deformconv2(x2))
+        m1 = nn.functional.interpolate(x1_, scale_factor=2, mode='bilinear', align_corners=True)
+        m2 = nn.functional.interpolate(x2_, scale_factor=4, mode='bilinear', align_corners=True)
+        return torch.cat([m0, m1, m2], 1)
+
+
+class InterViewAAModule(nn.Module):
+    def __init__(self,in_channels=32, bias=True):
+        super(InterViewAAModule, self).__init__()
+        self.reweight_network = nn.Sequential(
+                                    convgnrelu(in_channels, 4, kernel_size=3, stride=1, dilation=1, bias=bias),
+                                    resnet_block_gn(4, kernel_size=1),
+                                    nn.Conv2d(4, 1, kernel_size=1, padding=0),
+                                    nn.Sigmoid()
+                                )
+    
+    def forward(self, x):
+        return self.reweight_network(x)
+
+
+class FeatNet(nn.Module):
+    def __init__(self):
+        super(FeatNet, self).__init__()
+        base_filter = 8
+
+        self.init_conv = nn.Sequential(
+            convgnrelu(3, base_filter , kernel_size=3, stride=1, dilation=1),
+            convgnrelu(base_filter, base_filter * 2, kernel_size=3, stride=1, dilation=1)
+            )
+        self.conv0 = convgnrelu(base_filter * 2, base_filter * 4, kernel_size=3, stride=1, dilation=1)
+        self.conv1 = convgnrelu(base_filter * 4, base_filter * 4, kernel_size=3, stride=2, dilation=1)
+        self.conv2 = convgnrelu(base_filter * 4, base_filter * 4, kernel_size=3, stride=2, dilation=1)
+        self.intraAA = IntraViewAAModule()
+            
+
+    def forward(self, x):
+
+        x = self.init_conv(x)
+        x0 = self.conv0(x)
+        x1 = self.conv1(x0)
+        x2 = self.conv2(x1)
+
+        return self.intraAA(x0,x1,x2)
+
+
+class UNetConvLSTM(nn.Module):
+    def __init__(self, input_size, input_dim, hidden_dim, kernel_size, num_layers,
+                 bias=True):
+        super(UNetConvLSTM, self).__init__()
+
+        self._check_kernel_size_consistency(kernel_size)
+
+        # Make sure that both `kernel_size` and `hidden_dim` are lists having len == num_layers
+        kernel_size = self._extend_for_multilayer(kernel_size, num_layers)
+        hidden_dim  = self._extend_for_multilayer(hidden_dim, num_layers)
+        if not len(kernel_size) == len(hidden_dim) == num_layers:
+            raise ValueError('Inconsistent list length.')
+
+        self.height, self.width = input_size #feature: height, width)
+        print('Training Phase in UNetConvLSTM: {}, {}'.format(self.height, self.width))
+        self.input_dim  = input_dim # input channel
+        self.hidden_dim = hidden_dim # output channel [16, 16, 16, 16, 16, 8]
+        self.kernel_size = kernel_size # kernel size  [[3, 3]*5]
+        self.num_layers = num_layers # Unet layer size: must be odd
+        self.bias = bias
+
+        cell_list = []
+        self.down_num = (self.num_layers+1) / 2 
+        
+        for i in range(0, self.num_layers):
+            scale = 2**i if i < self.down_num else 2**(self.num_layers-i-1)
+            cell_list.append(ConvLSTMCell(input_size=(int(self.height/scale), int(self.width/scale)),
+                                        input_dim=self.input_dim[i],
+                                        hidden_dim=self.hidden_dim[i],
+                                        kernel_size=self.kernel_size[i],
+                                        bias=self.bias))
+
+        self.cell_list = nn.ModuleList(cell_list)
+        self.deconv_0 = deConvGnReLU(
+            16,
+            16, 
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=self.bias,
+            output_padding=1
+            )
+        self.deconv_1 = deConvGnReLU(
+            16,
+            16, 
+            kernel_size=3,
+            stride=2,
+            padding=1,
+            bias=self.bias,
+            output_padding=1
+            )
+        self.conv_0 = nn.Conv2d(8, 1, 3, 1, padding=1)
+
+    def forward(self, input_tensor, hidden_state=None, idx = 0, process_sq=True):
+        """
+        
+        Parameters
+        ----------
+        input_tensor: todo 
+            5-D Tensor either of shape (t, b, c, h, w) or (b, t, c, h, w)
+        hidden_state: todo
+            None. todo implement stateful
+            
+        Returns
+        -------
+        cost, hidden_state, skip_features (dict with 'h0', 'h1', 'h2')
+        
+        Skip features dimensions:
+            - h0: [B, 16, H, W] (full resolution)
+            - h1: [B, 16, H/2, W/2] (half resolution)
+            - h2: [B, 16, H/4, W/4] (quarter resolution)
+        """
+        if idx ==0 : # input the first layer of input image
+           hidden_state = self._init_hidden(batch_size=input_tensor.size(0))
+
+        layer_output_list = []
+        last_state_list   = []
+
+        seq_len = input_tensor.size(1)
+        
+        cur_layer_input = input_tensor
+        
+        if process_sq:
+            
+            h0, c0 = hidden_state[0]= self.cell_list[0](input_tensor=cur_layer_input,
+                                                cur_state=hidden_state[0])
+
+            h0_1 = nn.MaxPool2d((2, 2), stride=2)(h0)
+            h1, c1 = hidden_state[1] = self.cell_list[1](input_tensor=h0_1, 
+                                                cur_state=hidden_state[1])
+
+            h1_0 = nn.MaxPool2d((2, 2), stride=2)(h1)  
+            h2, c2 = hidden_state[2] = self.cell_list[2](input_tensor=h1_0,
+                                                cur_state=hidden_state[2])
+            h2_0 = self.deconv_0(h2) # auto reuse
+
+            h2_1 = torch.cat([h2_0, h1], 1)
+            h3, c3 = hidden_state[3] = self.cell_list[3](input_tensor=h2_1,
+                                                cur_state=hidden_state[3])
+            h3_0 = self.deconv_1(h3) # auto reuse
+            h3_1 = torch.cat([h3_0, h0], 1)
+            h4, c4 = hidden_state[4] = self.cell_list[4](input_tensor=h3_1,
+                                                cur_state=hidden_state[4])
+            
+            cost = self.conv_0(h4) # auto reuse
+            
+            # Return skip features from encoder layers for evidential skip connections
+            skip_features = {'h0': h0, 'h1': h1, 'h2': h2}
+
+            return cost, hidden_state, skip_features
+        else:   
+            for t in range(seq_len):
+                h0, c0 = self.cell_list[0](input_tensor=cur_layer_input[:, t, :, :, :],
+                                                    cur_state=hidden_state[0])
+                hidden_state[0] = [h0, c0]
+                h0_1 = nn.MaxPool2d((2, 2), stride=2)(h0)
+                h1, c1 = self.cell_list[1](input_tensor=h0_1, 
+                                                    cur_state=hidden_state[1])
+                hidden_state[1] = [h1, c1]
+                h1_0 = nn.MaxPool2d((2, 2), stride=2)(h1)  
+                h2, c2 = self.cell_list[2](input_tensor=h1_0,
+                                                    cur_state=hidden_state[2])
+                hidden_state[2] = [h2, c2]
+                h2_0 = self.deconv_0(h2) # auto reuse
+
+                h2_1 = torch.concat([h2_0, h1], 1)
+                h3, c3 = self.cell_list[3](input_tensor=h2_1,
+                                                    cur_state=hidden_state[3])
+                hidden_state[3] = [h3, c3]
+                h3_0 = self.deconv_1(h3) # auto reuse
+                h3_1 = torch.concat([h3_0, h0], 1)
+                h4, c4 = self.cell_list[4](input_tensor=h3_1,
+                                                    cur_state=hidden_state[4])
+                hidden_state[4] = [h4, c4]
+                
+                cost = self.conv_0(h4) # auto reuse
+                cost = nn.Tanh(cost)
+                # output cost
+                layer_output_list.append(cost)
+
+            prob_volume = torch.stack(layer_output_list, dim=1)
+
+            return prob_volume
+
+    def _init_hidden(self, batch_size):
+        init_states = []
+        for i in range(self.num_layers):
+            init_states.append(self.cell_list[i].init_hidden(batch_size))
+        return init_states
+
+    @staticmethod
+    def _check_kernel_size_consistency(kernel_size):
+        if not (isinstance(kernel_size, tuple) or
+                    (isinstance(kernel_size, list) and all([isinstance(elem, tuple) for elem in kernel_size]))):
+            raise ValueError('`kernel_size` must be tuple or list of tuples')
+
+    @staticmethod
+    def _extend_for_multilayer(param, num_layers):
+        if not isinstance(param, list):
+            param = [param] * num_layers
+        return param
+
+
+class AARMVSNetWrapper(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.original_model = EMVSNet(max_h=512, max_w=640, disparity_level=32).cuda()
+
+    def forward(self, x):
+        # Create dummy proj_matrices and depth_values with the expected shape and type
+        #x = x[0, :, :, :, :, :]
+        dummy_depth_values = torch.randn(1, 32).cuda()
+        dummy_proj_matrices = torch.randn(1, 5, 4, 4).cuda()
+        return self.original_model(x, proj_matrices=dummy_proj_matrices, depth_values=dummy_depth_values)
+
+
+class EMVSNet(nn.Module):
+    def __init__(self, disparity_level, image_scale=0.25, max_h=960, max_w=480, return_depth=False, evidential_method='der'):
+        """
+        EMVSNet model with evidential uncertainty estimation.
+        
+        Args:
+            disparity_level: Number of depth hypotheses
+            image_scale: Image scaling factor
+            max_h: Maximum image height
+            max_w: Maximum image width
+            return_depth: If True, return depth map; if False, return probability volume
+            evidential_method: 'der' (full NIG) or 'sder' (simplified, alpha = nu + 1)
+        """
+        super(EMVSNet, self).__init__()
+        self.feature = FeatNet()
+        input_size = (int(max_h * image_scale), int(max_w * image_scale))  # height, width
+
+        input_dim = [32, 16, 16, 32, 32]
+        hidden_dim = [16, 16, 16, 16, 8]
+        num_layers = 5
+        kernel_size = [(3, 3) for _ in range(num_layers)]
+
+        # Modules
+        self.cost_regularization = UNetConvLSTM(input_size, input_dim, hidden_dim, kernel_size, num_layers,
+                                                bias=True)
+        self.omega = InterViewAAModule(32)
+        self.evidential = EvidentialModule(maxdisp=disparity_level, method=evidential_method)
+
+        # Variables
+        self.return_depth = return_depth
+        self.image_scale = image_scale
+        self.max_h = max_h
+        self.max_w = max_w
+        # Target feature size for cost regularization (matches UNetConvLSTM input_size)
+        self.target_feature_h = int(max_h * image_scale)
+        self.target_feature_w = int(max_w * image_scale)
+
+    def forward(self, imgs, proj_matrices, depth_values):
+        imgs = torch.unbind(imgs, 1)
+        proj_matrices = torch.unbind(proj_matrices, 1)
+        assert len(imgs) == len(proj_matrices), "Different number of images and projection matrices"
+
+        num_depth = depth_values.shape[1]
+
+        # in: images; out: 32-channel feature maps
+        features = [self.feature(img) for img in imgs]
+        
+        # Downsample features to match UNetConvLSTM expected input size
+        # This allows processing images at custom resolution but evaluating at reduced resolution
+        target_size = (self.target_feature_h, self.target_feature_w)
+        features_downsampled = []
+        for feat in features:
+            # Check if downsampling is needed
+            if feat.shape[2] != target_size[0] or feat.shape[3] != target_size[1]:
+                feat_downsampled = F.interpolate(feat, size=target_size, mode='bilinear', align_corners=True)
+                features_downsampled.append(feat_downsampled)
+            else:
+                features_downsampled.append(feat)
+        
+        ref_feature, src_features = features_downsampled[0], features_downsampled[1:]
+        ref_proj, src_projs = proj_matrices[0], proj_matrices[1:]
+
+        # Recurrent process i-th depth layer
+        cost_reg_list = []
+        hidden_state = None
+        
+        # Collect skip features for each depth layer for evidential module
+        skip_features_list = {'h0': [], 'h1': [], 'h2': []}
+
+        # Training Phase
+        if not self.return_depth:
+            for d in range(num_depth):           
+                ref_volume = ref_feature
+                warped_volumes = None
+                for src_fea, src_proj in zip(src_features, src_projs):
+                    warped_volume = homo_warping_depthwise(src_fea, src_proj, ref_proj, depth_values[:, d])
+                    warped_volume = (warped_volume - ref_volume).pow_(2)
+                    reweight = self.omega(warped_volume)  
+                    if warped_volumes is None:
+                        warped_volumes = (reweight + 1) * warped_volume
+                    else:
+                        warped_volumes = warped_volumes + (reweight + 1) * warped_volume
+
+                volume_variance = warped_volumes / len(src_features)
+                cost_reg, hidden_state, skip_feat = self.cost_regularization(-1 * volume_variance, hidden_state, d)
+                cost_reg_list.append(cost_reg)
+                
+                # Collect skip features for this depth layer
+                skip_features_list['h0'].append(skip_feat['h0'])
+                skip_features_list['h1'].append(skip_feat['h1'])
+                skip_features_list['h2'].append(skip_feat['h2'])
+
+            prob_volume = torch.stack(cost_reg_list, dim=1).squeeze(2)
+
+            probability_volume = F.softmax(prob_volume, dim=1)  # get prob volume use for recurrent to decrease memory consumption
+
+            # Aggregate skip features across depth dimension
+            # h0: [B, 16, H, W] per depth -> stack to [B, 16, D, H, W]
+            # h1: [B, 16, H/2, W/2] per depth -> stack to [B, 16, D, H/2, W/2] then subsample to [B, 16, D/2, H/2, W/2]
+            # h2: [B, 16, H/4, W/4] per depth -> stack to [B, 16, D, H/4, W/4] then subsample to [B, 16, D/4, H/4, W/4]
+            h0_skip = torch.stack(skip_features_list['h0'], dim=2)  # [B, 16, D, H, W]
+            h1_skip_full = torch.stack(skip_features_list['h1'], dim=2)  # [B, 16, D, H/2, W/2]
+            h2_skip_full = torch.stack(skip_features_list['h2'], dim=2)  # [B, 16, D, H/4, W/4]
+            
+            # Subsample depth dimension to match evidential module's volume resolutions
+            # h1 should have D/2 depth, h2 should have D/4 depth
+            h1_skip = h1_skip_full[:, :, ::2, :, :]  # [B, 16, D/2, H/2, W/2]
+            h2_skip = h2_skip_full[:, :, ::4, :, :]  # [B, 16, D/4, H/4, W/4]
+            
+            aggregated_skip_features = {'h0': h0_skip, 'h1': h1_skip, 'h2': h2_skip}
+
+            evidential, prob_combine = self.evidential(probability_volume.unsqueeze(1), depth_values, aggregated_skip_features)
+
+            return probability_volume, evidential, prob_combine
+
+
+        #TODO include evidential - both simultaniously
+        # Test phase
+        else:
+            shape = ref_feature.shape
+            depth_image = torch.zeros(shape[0], shape[2], shape[3]).cuda()  # B * H * W
+            max_prob_image = torch.zeros(shape[0], shape[2], shape[3]).cuda()
+            exp_sum = torch.zeros(shape[0], shape[2], shape[3]).cuda()
+
+            for d in range(num_depth):
+                ref_volume = ref_feature
+                warped_volumes = None
+                for src_fea, src_proj in zip(src_features, src_projs):
+                    warped_volume = homo_warping_depthwise(src_fea, src_proj, ref_proj, depth_values[:, d])
+                    warped_volume = (warped_volume - ref_volume).pow_(2)
+                    reweight = self.omega(warped_volume)  # saliency
+                    if warped_volumes is None:
+                        warped_volumes = (reweight + 1) * warped_volume
+                    else:
+                        warped_volumes = warped_volumes + (reweight + 1) * warped_volume
+
+                volume_variance = warped_volumes / len(src_features)
+                cost_reg, hidden_state, skip_feat = self.cost_regularization(-1 * volume_variance, hidden_state, d)
+                cost_reg_list.append(cost_reg)
+                
+                # Collect skip features for this depth layer
+                skip_features_list['h0'].append(skip_feat['h0'])
+                skip_features_list['h1'].append(skip_feat['h1'])
+                skip_features_list['h2'].append(skip_feat['h2'])
+
+                prob = torch.exp(cost_reg.squeeze(1))
+                depth = depth_values[:, d]  # B
+                temp_depth_image = depth.view(shape[0], 1, 1).repeat(1, shape[2], shape[3])
+                update_flag_image = (max_prob_image < prob).type(torch.float)
+                new_max_prob_image = torch.mul(update_flag_image, prob) + torch.mul(1 - update_flag_image,
+                                                                                    max_prob_image)
+                new_depth_image = torch.mul(update_flag_image, temp_depth_image) + torch.mul(1 - update_flag_image,
+                                                                                             depth_image)
+                max_prob_image = new_max_prob_image
+                depth_image = new_depth_image
+                exp_sum = exp_sum + prob
+
+            forward_exp_sum = exp_sum  
+            forward_depth_map = depth_image
+
+            conf = max_prob_image / forward_exp_sum
+
+            prob_volume = torch.stack(cost_reg_list, dim=1).squeeze(2)
+            probability_volume = F.softmax(prob_volume, dim=1)  # get prob volume use for recurrent to decrease memory consumption
+            
+            # Aggregate skip features across depth dimension (same as training phase)
+            h0_skip = torch.stack(skip_features_list['h0'], dim=2)  # [B, 16, D, H, W]
+            h1_skip_full = torch.stack(skip_features_list['h1'], dim=2)  # [B, 16, D, H/2, W/2]
+            h2_skip_full = torch.stack(skip_features_list['h2'], dim=2)  # [B, 16, D, H/4, W/4]
+            
+            # Subsample depth dimension to match evidential module's volume resolutions
+            h1_skip = h1_skip_full[:, :, ::2, :, :]  # [B, 16, D/2, H/2, W/2]
+            h2_skip = h2_skip_full[:, :, ::4, :, :]  # [B, 16, D/4, H/4, W/4]
+            
+            aggregated_skip_features = {'h0': h0_skip, 'h1': h1_skip, 'h2': h2_skip}
+            
+            evidential, prob_combine = self.evidential(probability_volume.unsqueeze(1), depth_values, aggregated_skip_features)
+
+            return {"depth": forward_depth_map, "photometric_confidence": conf, 'evidential_prediction': evidential}
+
+def mvsnet_cls_loss(prob_volume, depth_gt, mask, depth_value, return_prob_map=False):
+    # depth_value: B * NUM
+    # get depth mask
+    mask_true = mask 
+    valid_pixel_num = torch.sum(mask_true, dim=[1,2]) + 1e-6
+
+    shape = depth_gt.shape
+
+    depth_num = depth_value.shape[-1]
+    depth_value_mat = depth_value.repeat(shape[1], shape[2], 1, 1).permute(2,3,0,1)
+   
+    gt_index_image = torch.argmin(torch.abs(depth_value_mat-depth_gt.unsqueeze(1)), dim=1)
+
+    gt_index_image = torch.mul(mask_true, gt_index_image.type(torch.float))
+    gt_index_image = torch.round(gt_index_image).type(torch.long).unsqueeze(1) # B, 1, H, W
+ 
+    # gt index map -> gt one hot volume (B x 1 x H x W )
+    gt_index_volume = torch.zeros(shape[0], depth_num, shape[1], shape[2]).type(mask_true.type()).scatter_(1, gt_index_image, 1)
+    # print('shape:', gt_index_volume.shape, )
+    # cross entropy image (B x D X H x W)
+    cross_entropy_image = -torch.sum(gt_index_volume * torch.log(prob_volume), dim=1).squeeze(1) # B, 1, H, W
+    # print('cross_entropy_image', cross_entropy_image)
+    # masked cross entropy loss
+    masked_cross_entropy_image = torch.mul(mask_true, cross_entropy_image) # valid pixel
+    masked_cross_entropy = torch.sum(masked_cross_entropy_image, dim=[1, 2])
+
+    masked_cross_entropy = torch.mean(masked_cross_entropy / valid_pixel_num) # Origin use sum : aggregate with batch
+    # winner-take-all depth map
+    wta_index_map = torch.argmax(prob_volume, dim=1, keepdim=True).type(torch.long)
+    wta_depth_map = torch.gather(depth_value_mat, 1, wta_index_map).squeeze(1)
+
+    if return_prob_map:
+        photometric_confidence = torch.max(prob_volume, dim=1)[0] # output shape dimension B * H * W
+        return masked_cross_entropy, wta_depth_map, photometric_confidence
+    return masked_cross_entropy, wta_depth_map
+

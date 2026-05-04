@@ -1,0 +1,42 @@
+__pycache__/
+.DS_Store
+event*
+.pytest_cache/
+.mypy_cache/
+temp_files/
+
+# Local/editor metadata
+.idea/
+.vscode/
+
+# Local env/config
+.env
+.env.*
+docker.env
+
+# Data, outputs, checkpoints
+data/
+checkpoints/
+output/
+outputs/
+outputs_dtu/
+evaluation/results/
+test_eval_results/
+uncertainty_eval/
+*.ckpt
+
+# Model and checkpoint files
+*.pth
+*.pt
+*.pkl
+
+# Log files
+*.log
+
+# HDF5 data files
+*.h5
+*.hdf5
+
+# NumPy arrays
+*.npy
+*.npz
