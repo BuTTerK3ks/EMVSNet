@@ -149,10 +149,11 @@ Please cite the EMVSNet paper if you use this codebase:
 
 ```bibtex
 @inproceedings{emvsnet2026,
-  title={EMVSNet},
-  author={TODO},
-  booktitle={TODO},
-  year={2026}
+  author = {Grannemann, Christian and Mehltretter, Max},
+  journal = {The International Archives of the Photogrammetry, Remote Sensing and Spatial Information Sciences},
+  title = {EMVSNet: Evidential Multi-View Stereo Reconstruction for Sampling-free Depth and Uncertainty Estimation},
+  year = {2026},
+  note = {Accepted for publication.}
 }
 ```
 
