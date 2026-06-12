@@ -1,0 +1,70 @@
+# Git files
+.git
+.gitignore
+.gitattributes
+
+# IDE files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# Data directories (will be mounted as volumes)
+data/
+checkpoints/
+output/
+temp_files/
+
+# Model and checkpoint files
+*.pth
+*.pt
+*.pkl
+*.ckpt
+
+# Log files
+*.log
+event*
+
+# Data files
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation build
+docs/_build/
+
+# Jupyter notebooks checkpoints
+.ipynb_checkpoints
+
+# Environment files (may contain sensitive info)
+.env
+docker.env
+*.env.local
+
+# Docker files (don't need to copy into image)
+# Note: docker-entrypoint.sh is needed in the image, so it's not ignored
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Plans and temporary files
+.cursor/
+*.plan.md
