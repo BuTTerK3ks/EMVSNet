@@ -4,7 +4,7 @@ Code release for EMVSNet (evidential multi-view stereo), with training, depth in
 
 ---
 
-> **News:** The EMVSNet paper has been accepted for the ISPRS 2026 Toronto Congress.
+> **News:** The EMVSNet paper has been presented at the ISPRS 2026 Toronto Congress.
 
 ---
 
@@ -154,12 +154,14 @@ Helpful script entry points:
 Please cite the EMVSNet paper if you use this codebase:
 
 ```bibtex
-@inproceedings{emvsnet2026,
-  author = {Grannemann, Christian and Mehltretter, Max},
-  journal = {The International Archives of the Photogrammetry, Remote Sensing and Spatial Information Sciences},
-  title = {EMVSNet: Evidential Multi-View Stereo Reconstruction for Sampling-free Depth and Uncertainty Estimation},
-  year = {2026},
-  note = {Accepted for publication.}
+@inproceedings{grannemann2026emvsnet,
+  title={EMVSNet: Evidential Multi-View Stereo Reconstruction for Sampling-free Depth and Uncertainty Estimation},
+  author={Grannemann, Christian and Mehltretter, Max},
+  journal={ISPRS Annals of the Photogrammetry, Remote Sensing and Spatial Information Sciences},
+  volume={11},
+  pages={259--267},
+  year={2026},
+  publisher={Copernicus GmbH}
 }
 ```
 
